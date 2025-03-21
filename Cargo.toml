@@ -1,0 +1,16 @@
+[package]
+name = "mev"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = {version = "1.44.1", features = ["full"]}
+alloy = {version = "0.12.6", features = ["full"]}
+eyre = "0.6.12"
+dotenv="*"
+futures-util = "0.3.31"
+serde= {version="1.0.219",features=["default"]}
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-appender = "0.2.3"
+futures="0.3.31"
