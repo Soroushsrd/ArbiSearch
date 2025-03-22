@@ -1,5 +1,6 @@
 use crate::connection::ConnectionManager;
-use alloy::rpc::types::{Header, Transaction};
+use alloy::rpc::types::{Header, Transaction, txpool};
+use alloy::sol;
 use eyre::Result;
 use futures::future;
 use futures_util::StreamExt;
@@ -22,6 +23,18 @@ pub static COMPLETION_CHANNEL: LazyLock<(
     let (sender, receiver) = mpsc::channel(100);
     (Mutex::new(sender), Mutex::new(receiver))
 });
+
+sol!(
+    #[allow(missing_docs)]
+    function transfer(address to, uint256 amount) external returns(bool);
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+);
 
 pub enum Events {
     NewBlock(Header),
@@ -115,6 +128,22 @@ impl EventMonitor {
                     match https_provider.get_transaction_by_hash(tx_hash).await {
                         Ok(Some(tx)) => {
                             info!(tx_hash = ?tx_hash, "Successfully retrieved transaction details");
+
+                            if let Some(block_hash) = tx.block_hash {
+                                info!(block_hash = ?block_hash, "Block hash");
+                            }
+                            if let Some(block_number) = tx.block_number {
+                                info!(block_number = ?block_number, "Block number");
+                            }
+                            if let Some(tx_index) = tx.transaction_index {
+                                info!(tx_index = ?tx_index, "Transaction index");
+                            }
+                            if let Some(gas_price) = tx.effective_gas_price {
+                                info!(gas_price = ?gas_price, "Effective gas price");
+                            }
+                            let tx_addr = tx.inner.clone().into_parts().1;
+                            info!(tx_addr = ?tx_addr, "Transaction address part");
+
                             // Send the transaction event to the channel
                             let sender = sender.lock().await;
                             if let Err(e) = sender.send(Events::PendingTransaction(tx)).await {
@@ -216,14 +245,9 @@ impl EventMonitor {
 
     #[instrument(skip(event_monitor), name = "process_events")]
     pub async fn process_events(event_monitor: Arc<Mutex<Self>>) -> Result<()> {
-        info!("Starting event processing loop");
         info!("=========== STARTING EVENT PROCESSING ===========");
 
-        let mut loop_count = 0;
         loop {
-            loop_count += 1;
-            info!("Event loop iteration {}", loop_count);
-
             tokio::select! {
                 event = async {
                     let mut rx = EVENT_CHANNEL.1.lock().await;
@@ -294,7 +318,6 @@ impl EventMonitor {
                     rx.recv().await
                 } => {
                     if let Some(completion) = completion {
-                        info!("Received a completion event!");
                         match completion {
                             CompletionEvent::BlockProcessed { block_number, tx_count } => {
                                 info!(
