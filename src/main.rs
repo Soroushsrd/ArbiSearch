@@ -1,6 +1,7 @@
 mod config;
 mod connection;
 mod event_handler;
+mod utils;
 
 use event_handler::EventMonitor;
 use eyre::Result;

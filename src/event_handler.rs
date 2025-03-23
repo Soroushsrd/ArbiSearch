@@ -1,10 +1,10 @@
 use crate::connection::ConnectionManager;
+use crate::utils::{decode_transfer_event, format_transfer_data};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::address;
 use alloy::rpc::types::{Filter, Header, Transaction};
 use alloy::sol;
 use eyre::Result;
-use futures::future;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -83,19 +83,6 @@ impl EventMonitor {
             subscription_handle: Vec::new(),
         })
     }
-    pub async fn join_all_tasks(&mut self) {
-        info!("joining all subscription tasks");
-        let mut results = Vec::new();
-        for handle in self.subscription_handle.drain(..) {
-            results.push(handle);
-        }
-        for result in future::join_all(results).await {
-            if let Err(e) = result {
-                error!(error = %e, "Task failed with error");
-            }
-        }
-        info!("All handles are joined!");
-    }
     #[instrument(skip(self), name = "monitor_blocks")]
     pub async fn monitor_blocks(&mut self) -> Result<()> {
         info!("Starting block monitoring");
@@ -141,29 +128,33 @@ impl EventMonitor {
                     let topics_str = format!("{:?}", log.topics());
                     let data_str = format!("{:?}", log.data());
 
-                    info!(
-                        address = %address_str,
-                        topics = %topics_str,
-                        data = %data_str,
-                        "Log received!"
-                    );
+                    match decode_transfer_event(&log) {
+                        Ok((from, to, amount)) => {
+                            let formatted =
+                                format_transfer_data(&log.address(), &from, &to, amount);
+                            info!("Decoded transfer: {}", formatted);
 
-                    let sender = sender.lock().await;
-                    if let Err(e) = sender
-                        .send(Events::DexEvent {
-                            address: address_str,
-                            topics: topics_str,
-                            data: data_str,
-                        })
-                        .await
-                    {
-                        error!(error = %e, "Failed to send DEX event");
-                        break;
+                            let sender = sender.lock().await;
+                            if let Err(e) = sender
+                                .send(Events::DexEvent {
+                                    address: address_str,
+                                    topics: topics_str,
+                                    data: data_str,
+                                })
+                                .await
+                            {
+                                error!(error = %e, "Failed to send DEX event");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to decode transfer event");
+                        }
                     }
                 }
             }
             .in_current_span(),
         );
+
         self.subscription_handle.push(handle);
         Ok(())
     }
@@ -313,14 +304,13 @@ impl EventMonitor {
                     rx.recv().await
                 } => {
                     if let Some(event) = event {
-                        info!("Received an event from event channel!");
                         match event {
                             Events::NewBlock(header) => {
-                                info!(
-                                    block_number = ?header.number,
-                                    block_hash = ?header.hash,
-                                    "New block received"
-                                );
+                                //info!(
+                                //    block_number = ?header.number,
+                                //    block_hash = ?header.hash,
+                                //    "New block received"
+                                //);
 
                                 let mut monitor = event_monitor.lock().await;
                                 if let Err(e) = monitor.process_block_tx(header).await {
@@ -334,13 +324,13 @@ impl EventMonitor {
                             },
                             Events::PendingTransaction(tx) => {
                                 let tx_hash = tx.block_hash.unwrap_or_default();
-                                info!(
-                                    tx_hash = ?tx_hash,
-                                    from = ?tx.block_number,
-                                    to = ?tx.transaction_index,
-                                    value = ?tx.effective_gas_price.unwrap(),
-                                    "Pending transaction received"
-                                );
+                                //info!(
+                                //    tx_hash = ?tx_hash,
+                                //    from = ?tx.block_number,
+                                //    to = ?tx.transaction_index,
+                                //    value = ?tx.effective_gas_price.unwrap(),
+                                //    "Pending transaction received"
+                                //);
 
                                 let sender = COMPLETION_CHANNEL.0.lock().await;
                                 if let Err(e) = sender.send(CompletionEvent::PendingTransactionProcessed {
@@ -350,10 +340,10 @@ impl EventMonitor {
                                 }
                             },
                             Events::DexEvent { address, topics, data } => {
-                                info!(
-                                    address = %address,
-                                    "DEX event received"
-                                );
+                                //info!(
+                                //    address = %address,
+                                //    "DEX event received"
+                                //);
 
                                 let sender = COMPLETION_CHANNEL.0.lock().await;
                                 if let Err(e) = sender.send(CompletionEvent::DexEventProcessed {
@@ -364,12 +354,12 @@ impl EventMonitor {
                             },
                             Events::NewTransaction(tx) => {
                                 let tx_hash = tx.block_hash.unwrap_or_default();
-                                info!(
-                                    tx_hash = ?tx_hash,
-                                    block_number = ?tx.block_number,
-                                    value = ?tx.effective_gas_price.unwrap(),
-                                    "New transaction confirmed"
-                                );
+                                //info!(
+                                //    tx_hash = ?tx_hash,
+                                //    block_number = ?tx.block_number,
+                                //    value = ?tx.effective_gas_price.unwrap(),
+                                //    "New transaction confirmed"
+                                //);
 
                                 let sender = COMPLETION_CHANNEL.0.lock().await;
                                 if let Err(e) = sender.send(CompletionEvent::TransactionProcessed {
