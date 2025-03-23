@@ -1,5 +1,7 @@
 use crate::connection::ConnectionManager;
-use alloy::rpc::types::{Header, Transaction, txpool};
+use alloy::eips::BlockNumberOrTag;
+use alloy::primitives::address;
+use alloy::rpc::types::{Filter, Header, Transaction};
 use alloy::sol;
 use eyre::Result;
 use futures::future;
@@ -40,6 +42,11 @@ pub enum Events {
     NewBlock(Header),
     NewTransaction(Transaction),
     PendingTransaction(Transaction),
+    DexEvent {
+        address: String,
+        topics: String,
+        data: String,
+    },
 }
 pub enum CompletionEvent {
     BlockProcessed {
@@ -51,6 +58,9 @@ pub enum CompletionEvent {
     },
     PendingTransactionProcessed {
         tx_hash: String,
+    },
+    DexEventProcessed {
+        address: String,
     },
     Error {
         context: String,
@@ -105,6 +115,55 @@ impl EventMonitor {
                 }
             }
         }.in_current_span());
+        self.subscription_handle.push(handle);
+        Ok(())
+    }
+    #[instrument(skip(self), name = "monitor_dex")]
+    pub async fn monitor_dex(&mut self) -> Result<()> {
+        info!("starting dex monitoring");
+        let provider = self.connection_manager.wss_provider.clone();
+        let uniswap_token_address = address!("dac17f958d2ee523a2206206994597c13d831ec7"); // usdt
+        let filter = Filter::new()
+            .address(uniswap_token_address)
+            // By specifying an `event` or `event_signature` we listen for a specific event of the
+            // contract. In this case the `Transfer(address,address,uint256)` event.
+            .event("Transfer(address,address,uint256)")
+            .from_block(BlockNumberOrTag::Latest);
+        let sub = provider.subscribe_logs(&filter).await?;
+        let mut stream = sub.into_stream();
+        let sender = &EVENT_CHANNEL.0;
+
+        let handle = tokio::spawn(
+            async move {
+                info!("Dex monitoring task started!");
+                while let Some(log) = stream.next().await {
+                    let address_str = format!("{:?}", log.address());
+                    let topics_str = format!("{:?}", log.topics());
+                    let data_str = format!("{:?}", log.data());
+
+                    info!(
+                        address = %address_str,
+                        topics = %topics_str,
+                        data = %data_str,
+                        "Log received!"
+                    );
+
+                    let sender = sender.lock().await;
+                    if let Err(e) = sender
+                        .send(Events::DexEvent {
+                            address: address_str,
+                            topics: topics_str,
+                            data: data_str,
+                        })
+                        .await
+                    {
+                        error!(error = %e, "Failed to send DEX event");
+                        break;
+                    }
+                }
+            }
+            .in_current_span(),
+        );
         self.subscription_handle.push(handle);
         Ok(())
     }
@@ -290,6 +349,19 @@ impl EventMonitor {
                                     error!(error = %e, "Failed to send pending tx completion event");
                                 }
                             },
+                            Events::DexEvent { address, topics, data } => {
+                                info!(
+                                    address = %address,
+                                    "DEX event received"
+                                );
+
+                                let sender = COMPLETION_CHANNEL.0.lock().await;
+                                if let Err(e) = sender.send(CompletionEvent::DexEventProcessed {
+                                    address,
+                                }).await {
+                                    error!(error = %e, "Failed to send DEX event completion");
+                                }
+                            },
                             Events::NewTransaction(tx) => {
                                 let tx_hash = tx.block_hash.unwrap_or_default();
                                 info!(
@@ -338,6 +410,12 @@ impl EventMonitor {
                                     "Pending transaction processing completed"
                                 );
                             },
+                            CompletionEvent::DexEventProcessed { address } => {
+                                debug!(
+                                    address = %address,
+                                    "DEX event processing completed"
+                                );
+                            },
                             CompletionEvent::Error { context, message } => {
                                 error!(
                                     context = %context,
@@ -367,7 +445,7 @@ impl EventMonitor {
         info!("Starting blockchain monitoring services");
 
         self.monitor_blocks().await?;
-
+        self.monitor_dex().await?;
         self.monitor_pending_tx().await?;
 
         info!("All monitoring services started successfully");
