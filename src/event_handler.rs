@@ -1,9 +1,10 @@
 use crate::connection::ConnectionManager;
-use crate::utils::{decode_transfer_event, format_transfer_data};
+use crate::utils::{
+    decode_swap_event, decode_transfer_event, format_swap_data, format_transfer_data,
+};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::address;
 use alloy::rpc::types::{Filter, Header, Transaction};
-use alloy::sol;
 use eyre::Result;
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -26,25 +27,24 @@ pub static COMPLETION_CHANNEL: LazyLock<(
     (Mutex::new(sender), Mutex::new(receiver))
 });
 
-sol!(
-    #[allow(missing_docs)]
-    function transfer(address to, uint256 amount) external returns(bool);
-    function swapExactTokensForTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        address[] calldata path,
-        address to,
-        uint256 deadline
-    ) external returns (uint256[] memory amounts);
-);
+const TRANSFER_EVENT: &str = "Transfer(address,address,uint256)";
+const SYNC_EVENT: &str = "Sync(uint112,uint112)";
+const SWAP_EVENT: &str = "Swap(address,uint256,uint256,uint256,uint256,address)";
+const MINT_EVENT: &str = "Mint(address,uint256,uint256)";
+const BURN_EVENT: &str = "Burn(address,uint256,uint256,address)";
 
 pub enum Events {
     NewBlock(Header),
     NewTransaction(Transaction),
     PendingTransaction(Transaction),
-    DexEvent {
+    TransferEvent {
         address: String,
         topics: String,
+        data: String,
+    },
+    SwapEvent {
+        //address: String,
+        //topics:String,
         data: String,
     },
 }
@@ -59,8 +59,11 @@ pub enum CompletionEvent {
     PendingTransactionProcessed {
         tx_hash: String,
     },
-    DexEventProcessed {
+    TransferEventProcessed {
         address: String,
+    },
+    SwapEventProcessed {
+        data: String,
     },
     Error {
         context: String,
@@ -105,16 +108,14 @@ impl EventMonitor {
         self.subscription_handle.push(handle);
         Ok(())
     }
-    #[instrument(skip(self), name = "monitor_dex")]
-    pub async fn monitor_dex(&mut self) -> Result<()> {
-        info!("starting dex monitoring");
+    #[instrument(skip(self), name = "monitor_transfer_event")]
+    pub async fn monitor_transfer_event(&mut self) -> Result<()> {
+        info!("starting TRANSFER monitoring");
         let provider = self.connection_manager.wss_provider.clone();
         let uniswap_token_address = address!("dac17f958d2ee523a2206206994597c13d831ec7"); // usdt
         let filter = Filter::new()
             .address(uniswap_token_address)
-            // By specifying an `event` or `event_signature` we listen for a specific event of the
-            // contract. In this case the `Transfer(address,address,uint256)` event.
-            .event("Transfer(address,address,uint256)")
+            .event(TRANSFER_EVENT)
             .from_block(BlockNumberOrTag::Latest);
         let sub = provider.subscribe_logs(&filter).await?;
         let mut stream = sub.into_stream();
@@ -122,7 +123,7 @@ impl EventMonitor {
 
         let handle = tokio::spawn(
             async move {
-                info!("Dex monitoring task started!");
+                info!("Transfer monitoring task started!");
                 while let Some(log) = stream.next().await {
                     let address_str = format!("{:?}", log.address());
                     let topics_str = format!("{:?}", log.topics());
@@ -136,14 +137,14 @@ impl EventMonitor {
 
                             let sender = sender.lock().await;
                             if let Err(e) = sender
-                                .send(Events::DexEvent {
+                                .send(Events::TransferEvent {
                                     address: address_str,
                                     topics: topics_str,
                                     data: data_str,
                                 })
                                 .await
                             {
-                                error!(error = %e, "Failed to send DEX event");
+                                error!(error = %e, "Failed to send swap event");
                             }
                         }
                         Err(e) => {
@@ -158,6 +159,100 @@ impl EventMonitor {
         self.subscription_handle.push(handle);
         Ok(())
     }
+    #[instrument(skip(self), name = "monitor_swap_event")]
+    pub async fn monitor_swap_event(&mut self) -> Result<()> {
+        info!("Starting SWAP events!");
+        let provider = self.connection_manager.wss_provider.clone();
+
+        let uniswap_v2_pool_addr_1 = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"); // USDC/ETH
+        let uniswap_v2_pool_addr_2 = address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"); // ETH/USDT
+
+        let filter_1 = Filter::new()
+            .address(uniswap_v2_pool_addr_1)
+            .event(SWAP_EVENT)
+            .from_block(BlockNumberOrTag::Latest);
+        let filter_2 = Filter::new()
+            .address(uniswap_v2_pool_addr_2)
+            .event(SWAP_EVENT)
+            .from_block(BlockNumberOrTag::Latest);
+
+        let sub_1 = provider.subscribe_logs(&filter_1).await?;
+        let sub_2 = provider.subscribe_logs(&filter_2).await?;
+
+        let mut stream = sub_1.into_stream();
+        let mut stream_2 = sub_2.into_stream();
+
+        let sender_channel = &EVENT_CHANNEL.0;
+
+        let handle = tokio::spawn(
+            async move {
+                info!("Swap Monitoring Task Started");
+                while let Some(log) = stream.next().await {
+                    info!(log_data= ?log.data(), "swap log data ");
+                    let data = format!("{:?}", log.data());
+                    match decode_swap_event(&log) {
+                        Ok((sender, amount0_in, amount1_in, amount0_out, amount1_out, to)) => {
+                            let formatted = format_swap_data(
+                                &log.address(),
+                                &sender,
+                                amount0_in,
+                                amount1_in,
+                                amount0_out,
+                                amount1_out,
+                                &to,
+                            );
+                            info!("decoded swap: {}", formatted);
+
+                            let sender_channel = sender_channel.lock().await;
+                            if let Err(e) = sender_channel.send(Events::SwapEvent { data }).await {
+                                error!(error = %e, "failed to send swap event");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to decode swap event");
+                        }
+                    }
+                }
+            }
+            .in_current_span(),
+        );
+        let handle_2 = tokio::spawn(
+            async move {
+                info!("Swap Monitoring Task2 Started");
+                while let Some(log) = stream_2.next().await {
+                    info!(log_data= ?log.data(), "swap log data ");
+                    let data = format!("{:?}", log.data());
+                    match decode_swap_event(&log) {
+                        Ok((sender, amount0_in, amount1_in, amount0_out, amount1_out, to)) => {
+                            let formatted = format_swap_data(
+                                &log.address(),
+                                &sender,
+                                amount0_in,
+                                amount1_in,
+                                amount0_out,
+                                amount1_out,
+                                &to,
+                            );
+                            info!("decoded swap: {}", formatted);
+
+                            let sender_channel = sender_channel.lock().await;
+                            if let Err(e) = sender_channel.send(Events::SwapEvent { data }).await {
+                                error!(error = %e, "failed to send swap event");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to decode swap event");
+                        }
+                    }
+                }
+            }
+            .in_current_span(),
+        );
+        self.subscription_handle.push(handle_2);
+        self.subscription_handle.push(handle);
+        Ok(())
+    }
+
     #[instrument(skip(self), name = "monitor_pending_tx")]
     pub async fn monitor_pending_tx(&mut self) -> Result<()> {
         info!("Starting pending transaction monitoring");
@@ -306,11 +401,6 @@ impl EventMonitor {
                     if let Some(event) = event {
                         match event {
                             Events::NewBlock(header) => {
-                                //info!(
-                                //    block_number = ?header.number,
-                                //    block_hash = ?header.hash,
-                                //    "New block received"
-                                //);
 
                                 let mut monitor = event_monitor.lock().await;
                                 if let Err(e) = monitor.process_block_tx(header).await {
@@ -324,13 +414,6 @@ impl EventMonitor {
                             },
                             Events::PendingTransaction(tx) => {
                                 let tx_hash = tx.block_hash.unwrap_or_default();
-                                //info!(
-                                //    tx_hash = ?tx_hash,
-                                //    from = ?tx.block_number,
-                                //    to = ?tx.transaction_index,
-                                //    value = ?tx.effective_gas_price.unwrap(),
-                                //    "Pending transaction received"
-                                //);
 
                                 let sender = COMPLETION_CHANNEL.0.lock().await;
                                 if let Err(e) = sender.send(CompletionEvent::PendingTransactionProcessed {
@@ -339,27 +422,17 @@ impl EventMonitor {
                                     error!(error = %e, "Failed to send pending tx completion event");
                                 }
                             },
-                            Events::DexEvent { address, topics, data } => {
-                                //info!(
-                                //    address = %address,
-                                //    "DEX event received"
-                                //);
+                            Events::TransferEvent { address, .. } => {
 
                                 let sender = COMPLETION_CHANNEL.0.lock().await;
-                                if let Err(e) = sender.send(CompletionEvent::DexEventProcessed {
+                                if let Err(e) = sender.send(CompletionEvent::TransferEventProcessed {
                                     address,
                                 }).await {
-                                    error!(error = %e, "Failed to send DEX event completion");
+                                    error!(error = %e, "Failed to send Transfer event completion");
                                 }
                             },
                             Events::NewTransaction(tx) => {
                                 let tx_hash = tx.block_hash.unwrap_or_default();
-                                //info!(
-                                //    tx_hash = ?tx_hash,
-                                //    block_number = ?tx.block_number,
-                                //    value = ?tx.effective_gas_price.unwrap(),
-                                //    "New transaction confirmed"
-                                //);
 
                                 let sender = COMPLETION_CHANNEL.0.lock().await;
                                 if let Err(e) = sender.send(CompletionEvent::TransactionProcessed {
@@ -367,7 +440,15 @@ impl EventMonitor {
                                 }).await {
                                     error!(error = %e, "Failed to send tx completion event");
                                 }
-                            }
+                            },
+                            Events::SwapEvent{data} => {
+
+                                let sender = COMPLETION_CHANNEL.0.lock().await;
+                                if let Err(e) = sender.send(CompletionEvent::SwapEventProcessed { data }).await {
+                                    error!(error = %e, "Failed to send tx completion event");
+                                }
+                            },
+
                         }
                     } else {
                         info!("Event channel closed, exiting event processing loop");
@@ -400,10 +481,16 @@ impl EventMonitor {
                                     "Pending transaction processing completed"
                                 );
                             },
-                            CompletionEvent::DexEventProcessed { address } => {
+                            CompletionEvent::TransferEventProcessed { address } => {
                                 debug!(
                                     address = %address,
-                                    "DEX event processing completed"
+                                    "Transfer event processing completed"
+                                );
+                            },
+                            CompletionEvent::SwapEventProcessed { data } => {
+                                debug!(
+                                    data = %data,
+                                    "Swap event processing completed"
                                 );
                             },
                             CompletionEvent::Error { context, message } => {
@@ -435,7 +522,8 @@ impl EventMonitor {
         info!("Starting blockchain monitoring services");
 
         self.monitor_blocks().await?;
-        self.monitor_dex().await?;
+        self.monitor_transfer_event().await?;
+        self.monitor_swap_event().await?;
         self.monitor_pending_tx().await?;
 
         info!("All monitoring services started successfully");
