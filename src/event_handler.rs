@@ -1,6 +1,7 @@
 use crate::connection::ConnectionManager;
 use crate::utils::{
-    decode_swap_event, decode_transfer_event, format_swap_data, format_transfer_data,
+    decode_mint_event, decode_swap_event, decode_transfer_event, format_mint_data,
+    format_swap_data, format_transfer_data,
 };
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::address;
@@ -39,12 +40,15 @@ pub enum Events {
     PendingTransaction(Transaction),
     TransferEvent {
         address: String,
-        topics: String,
-        data: String,
+        _topics: String,
+        _data: String,
     },
     SwapEvent {
         //address: String,
         //topics:String,
+        data: String,
+    },
+    MintEvent {
         data: String,
     },
 }
@@ -63,6 +67,9 @@ pub enum CompletionEvent {
         address: String,
     },
     SwapEventProcessed {
+        data: String,
+    },
+    MintEventProcessed {
         data: String,
     },
     Error {
@@ -139,8 +146,8 @@ impl EventMonitor {
                             if let Err(e) = sender
                                 .send(Events::TransferEvent {
                                     address: address_str,
-                                    topics: topics_str,
-                                    data: data_str,
+                                    _topics: topics_str,
+                                    _data: data_str,
                                 })
                                 .await
                             {
@@ -159,6 +166,87 @@ impl EventMonitor {
         self.subscription_handle.push(handle);
         Ok(())
     }
+
+    #[instrument(skip(self), name = "monitor_swap_event")]
+    pub async fn monitor_mint_event(&mut self) -> Result<()> {
+        info!("Starting Mint events!");
+        let provider = self.connection_manager.wss_provider.clone();
+
+        let uniswap_v2_pool_addr_1 = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"); // USDC/ETH
+        let uniswap_v2_pool_addr_2 = address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"); // ETH/USDT
+
+        let filter_1 = Filter::new()
+            .address(uniswap_v2_pool_addr_1)
+            .event(MINT_EVENT)
+            .from_block(BlockNumberOrTag::Latest);
+        let filter_2 = Filter::new()
+            .address(uniswap_v2_pool_addr_2)
+            .event(MINT_EVENT)
+            .from_block(BlockNumberOrTag::Latest);
+
+        let sub_1 = provider.subscribe_logs(&filter_1).await?;
+        let sub_2 = provider.subscribe_logs(&filter_2).await?;
+
+        let mut stream = sub_1.into_stream();
+        let mut stream_2 = sub_2.into_stream();
+
+        let sender_channel = &EVENT_CHANNEL.0;
+
+        let handle = tokio::spawn(
+            async move {
+                info!("Mint Monitoring Task Started");
+                while let Some(log) = stream.next().await {
+                    info!(log_data= ?log.data(), "Mint log data ");
+                    let data = format!("{:?}", log.data());
+                    match decode_mint_event(&log) {
+                        Ok((sender, amount0, amount1)) => {
+                            let formatted =
+                                format_mint_data(&log.address(), &sender, amount0, amount1);
+                            info!("decoded mint: {}", formatted);
+
+                            let sender_channel = sender_channel.lock().await;
+                            if let Err(e) = sender_channel.send(Events::MintEvent { data }).await {
+                                error!(error = %e, "failed to send mint event");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to decode mint event");
+                        }
+                    }
+                }
+            }
+            .in_current_span(),
+        );
+        let handle_2 = tokio::spawn(
+            async move {
+                info!("Mint Monitoring Task2 Started");
+                while let Some(log) = stream_2.next().await {
+                    info!(log_data= ?log.data(), "mint log data ");
+                    let data = format!("{:?}", log.data());
+                    match decode_mint_event(&log) {
+                        Ok((sender, amount0, amount1)) => {
+                            let formatted =
+                                format_mint_data(&log.address(), &sender, amount0, amount1);
+                            info!("decoded mint: {}", formatted);
+
+                            let sender_channel = sender_channel.lock().await;
+                            if let Err(e) = sender_channel.send(Events::MintEvent { data }).await {
+                                error!(error = %e, "failed to send mint event");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to decode mint event");
+                        }
+                    }
+                }
+            }
+            .in_current_span(),
+        );
+        self.subscription_handle.push(handle_2);
+        self.subscription_handle.push(handle);
+        Ok(())
+    }
+
     #[instrument(skip(self), name = "monitor_swap_event")]
     pub async fn monitor_swap_event(&mut self) -> Result<()> {
         info!("Starting SWAP events!");
@@ -445,10 +533,16 @@ impl EventMonitor {
 
                                 let sender = COMPLETION_CHANNEL.0.lock().await;
                                 if let Err(e) = sender.send(CompletionEvent::SwapEventProcessed { data }).await {
-                                    error!(error = %e, "Failed to send tx completion event");
+                                    error!(error = %e, "Failed to send swap completion event");
                                 }
                             },
+                            Events::MintEvent{data} => {
 
+                                let sender = COMPLETION_CHANNEL.0.lock().await;
+                                if let Err(e) = sender.send(CompletionEvent::MintEventProcessed { data }).await {
+                                    error!(error = %e, "Failed to send mint completion event");
+                                }
+                            },
                         }
                     } else {
                         info!("Event channel closed, exiting event processing loop");
@@ -493,6 +587,12 @@ impl EventMonitor {
                                     "Swap event processing completed"
                                 );
                             },
+                            CompletionEvent::MintEventProcessed { data } => {
+                                debug!(
+                                    data = %data,
+                                    "Mint event processing completed"
+                                );
+                            },
                             CompletionEvent::Error { context, message } => {
                                 error!(
                                     context = %context,
@@ -524,6 +624,7 @@ impl EventMonitor {
         self.monitor_blocks().await?;
         self.monitor_transfer_event().await?;
         self.monitor_swap_event().await?;
+        self.monitor_mint_event().await?;
         self.monitor_pending_tx().await?;
 
         info!("All monitoring services started successfully");

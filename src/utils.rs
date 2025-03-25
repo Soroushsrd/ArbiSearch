@@ -14,7 +14,66 @@ use alloy::{
     primitives::{Address, U256},
     rpc::types::Log,
 };
-use eyre::Result;
+use eyre::{OptionExt, Result};
+
+pub fn decode_mint_event(log: &Log) -> Result<(Address, U256, U256)> {
+    let mint_event_signature =
+        hex::decode("4c209b5fc8ad50758f13e2e1088ba56a560dff690a1c6fef26394f4c03821c4f")
+            .map_err(|e| format!("Failed to decode event signature: {}", e))
+            .unwrap();
+    let topic0 = log
+        .topic0()
+        .ok_or_eyre("missing topic0 field".to_string())
+        .unwrap();
+
+    if topic0 != mint_event_signature.as_slice() {
+        return Err(eyre::eyre!("Not a Mint event"));
+    }
+
+    //let sender = Address::from_slice(&log.topics()[1].as_slice())[12..];
+    let sender = Address::from_slice(&log.data().data[12..32]);
+
+    let amount0 = U256::from_be_slice(&log.data().data[32..64]);
+
+    let amount1 = U256::from_be_slice(&log.data().data[64..96]);
+
+    Ok((sender, amount0, amount1))
+}
+
+pub fn format_mint_data(
+    pool_address: &Address,
+    sender: &Address,
+    amount0: U256,
+    amount1: U256,
+) -> String {
+    let (token0, token1, decimals0, decimals1) =
+        match pool_address.to_string().to_lowercase().as_str() {
+            "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc" => ("USDC", "ETH", 6, 18),
+            "0x0d4a11d5eeaac28ec3f61d100daf4d40471f1852" => ("ETH", "USDT", 18, 6),
+            _ => ("Token0", "Token1", 18, 18),
+        };
+
+    let decimal_factor0 = U256::from(10).pow(U256::from(decimals0));
+    let decimal_factor1 = U256::from(10).pow(U256::from(decimals1));
+
+    let whole_0 = amount0 / decimal_factor0;
+    let fraction_0 = amount0 % decimal_factor0;
+
+    let whole_1 = amount1 / decimal_factor1;
+    let fraction_1 = amount1 % decimal_factor1;
+
+    let formatted_0 = format!("{}.{}", whole_0, fraction_0);
+    let formatted_1 = format!("{}.{}", whole_1, fraction_1);
+
+    format!(
+        "Mint: Added {} {} and {} {} by {}",
+        formatted_0,
+        token0,
+        formatted_1,
+        token1,
+        sender.to_string()
+    )
+}
 
 pub fn decode_swap_event(log: &Log) -> Result<(Address, U256, U256, U256, U256, Address)> {
     let swap_event_signature =
@@ -24,7 +83,7 @@ pub fn decode_swap_event(log: &Log) -> Result<(Address, U256, U256, U256, U256, 
 
     let topic0 = log
         .topic0()
-        .ok_or_else(|| "missing topic0".to_string())
+        .ok_or_eyre("missing topic0".to_string())
         .unwrap();
 
     if topic0 != swap_event_signature.as_slice() {
