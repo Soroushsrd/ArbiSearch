@@ -29,10 +29,10 @@ pub static COMPLETION_CHANNEL: LazyLock<(
 });
 
 const TRANSFER_EVENT: &str = "Transfer(address,address,uint256)";
-const SYNC_EVENT: &str = "Sync(uint112,uint112)";
+//const SYNC_EVENT: &str = "Sync(uint112,uint112)";
 const SWAP_EVENT: &str = "Swap(address,uint256,uint256,uint256,uint256,address)";
 const MINT_EVENT: &str = "Mint(address,uint256,uint256)";
-const BURN_EVENT: &str = "Burn(address,uint256,uint256,address)";
+//const BURN_EVENT: &str = "Burn(address,uint256,uint256,address)";
 
 pub enum Events {
     NewBlock(Header),

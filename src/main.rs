@@ -1,6 +1,7 @@
 mod config;
 mod connection;
 mod event_handler;
+mod price_calc;
 mod utils;
 
 use event_handler::EventMonitor;
