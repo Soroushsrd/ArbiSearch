@@ -1,10 +1,7 @@
-use alloy::{
-    primitives::{Address, U256},
-    signers::k256::elliptic_curve::rand_core::le,
-};
+use alloy::primitives::{Address, U256};
 use eyre::{OptionExt, Result, eyre};
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct PoolInfo {
@@ -106,6 +103,37 @@ impl PriceCalculator {
         );
         Ok(())
     }
+
+    pub fn register_common_tokens(&mut self) -> Result<()> {
+        // Major tokens
+        self.register_token(
+            Address::parse_checksummed("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", None).unwrap(),
+            "WETH".to_string(),
+            18,
+        )?;
+        self.register_token(
+            Address::parse_checksummed("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", None).unwrap(),
+            "USDC".to_string(),
+            6,
+        )?;
+        self.register_token(
+            Address::parse_checksummed("0xdAC17F958D2ee523a2206206994597C13D831ec7", None).unwrap(),
+            "USDT".to_string(),
+            6,
+        )?;
+        self.register_token(
+            Address::parse_checksummed("0x6B175474E89094C44Da98b954EedeAC495271d0F", None).unwrap(),
+            "DAI".to_string(),
+            18,
+        )?;
+        self.register_token(
+            Address::parse_checksummed("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", None).unwrap(),
+            "WBTC".to_string(),
+            8,
+        )?;
+        Ok(())
+    }
+
     /// gets the spot price of token b in terms of token a
     /// returns how many token b you get for 1 amount of token a
     pub fn get_spot_price(&self, token_a: &Address, token_b: &Address) -> Result<f64> {
@@ -285,7 +313,7 @@ impl PriceCalculator {
     ) -> Result<()> {
         match self.pools.get_mut(&pool_address) {
             Some(pool) => {
-                debug!(
+                info!(
                     pool_address = %pool_address,
                     old_reserve0 = %pool.reserve0,
                     old_reserve1 = %pool.reserve1,
@@ -299,7 +327,7 @@ impl PriceCalculator {
                 Ok(())
             }
             None => {
-                warn!(pool_address = %pool_address, "Pool not found");
+                error!(pool_address = %pool_address, "Pool not found");
                 Err(eyre::eyre!("Pool not found: {}", pool_address))
             }
         }
